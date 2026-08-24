@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+<title>RANDOM ROUTE — Flight Planner</title>
+<meta name="description" content="Generiert plausible Zufallsrouten für deine Flugzeugflotte auf einem 3D-Globus.">
+<meta name="theme-color" content="#0a0e14">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="globeContainer" aria-hidden="true"></div>
+
+<!-- top status strip -->
+<header class="statusbar">
+  <div class="statusbar__brand">
+    <span class="statusbar__glyph">✈</span>
+    <span class="statusbar__title">RANDOM<span class="accent">ROUTE</span></span>
+  </div>
+  <div class="statusbar__clock" id="clockReadout">--:--:--Z</div>
+  <button id="panelToggle" class="statusbar__toggle" aria-expanded="true" aria-controls="cdu">
+    <span class="toggle__label">CDU</span>
+    <span class="toggle__chevron">▾</span>
+  </button>
+</header>
+
+<!-- the "Control Display Unit" panel -->
+<div id="cdu" class="cdu">
+  <nav class="cdu__tabs" role="tablist">
+    <button class="cdu__tab is-active" data-tab="route" role="tab" aria-selected="true">ROUTE</button>
+    <button class="cdu__tab" data-tab="fleet" role="tab" aria-selected="false">FLEET</button>
+    <button class="cdu__tab" data-tab="info" role="tab" aria-selected="false">INFO</button>
+  </nav>
+
+  <div class="cdu__screen">
+
+    <!-- ROUTE PAGE -->
+    <section class="cdu__page is-active" id="page-route">
+      <div class="cdu__pageTitle"><span class="lsk">&lt;</span> RTE GENERATOR</div>
+
+      <label class="field">
+        <span class="field__label">AIRCRAFT</span>
+        <select id="aircraftSelect" class="field__input select">
+          <option value="__random__">— RANDOM (FLEET) —</option>
+        </select>
+      </label>
+
+      <label class="field">
+        <span class="field__label">GEWÜNSCHTE FLUGZEIT (MIN)</span>
+        <input type="number" id="durationInput" class="field__input" min="5" step="5">
+      </label>
+      <div class="note note--tight" id="durationHint"></div>
+
+      <button id="generateBtn" class="btn btn--primary" disabled>
+        <span class="btn__icon">⟳</span> GENERATE ROUTE
+      </button>
+
+      <div id="emptyFleetNote" class="note">
+        Keine Flugzeuge in der Flotte. Wechsle zu <b>FLEET</b> und leg eines an.
+      </div>
+
+      <div id="routeResult" class="routeResult" hidden>
+        <div class="routeResult__legrow">
+          <div class="airportBlock">
+            <div class="airportBlock__code" id="depCode">----</div>
+            <div class="airportBlock__icao" id="depIcao">----</div>
+            <div class="airportBlock__name" id="depName">—</div>
+            <div class="airportBlock__place" id="depPlace">—</div>
+          </div>
+          <div class="routeResult__arrow">→</div>
+          <div class="airportBlock">
+            <div class="airportBlock__code" id="arrCode">----</div>
+            <div class="airportBlock__icao" id="arrIcao">----</div>
+            <div class="airportBlock__name" id="arrName">—</div>
+            <div class="airportBlock__place" id="arrPlace">—</div>
+          </div>
+        </div>
+
+        <div class="scratchpad">
+          <div class="scratchpad__row">
+            <span>A/C</span><span id="rAircraft">—</span>
+          </div>
+          <div class="scratchpad__row">
+            <span>DIST</span><span id="rDist">—</span>
+          </div>
+          <div class="scratchpad__row">
+            <span>EET</span><span id="rTime">—</span>
+          </div>
+          <div class="scratchpad__row">
+            <span>RANGE USED</span><span id="rRangeUse">—</span>
+          </div>
+          <div class="scratchpad__row">
+            <span>FLUGZEIT GEWÄHLT</span><span id="rMaxTime">—</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- FLEET PAGE -->
+    <section class="cdu__page" id="page-fleet">
+      <div class="cdu__pageTitle"><span class="lsk">&lt;</span> FLEET MGMT</div>
+
+      <div id="fleetList" class="fleetList"></div>
+
+      <form id="fleetForm" class="fleetForm">
+        <div class="fleetForm__title">+ NEW AIRCRAFT</div>
+
+        <label class="field">
+          <span class="field__label">MSFS 2024 STANDARDFLOTTE</span>
+          <select class="field__input select" id="msfsPreset">
+            <option value="">— eigenes Flugzeug —</option>
+          </select>
+        </label>
+
+        <label class="field">
+          <span class="field__label">NAME</span>
+          <input class="field__input" type="text" id="acName" placeholder="z.B. Cessna 172 &quot;OE-ABC&quot;" required maxlength="40">
+        </label>
+        <label class="field">
+          <span class="field__label">KATEGORIE</span>
+          <select class="field__input select" id="acCategory"></select>
+        </label>
+        <div class="fieldRow">
+          <label class="field">
+            <span class="field__label">CRUISE KT</span>
+            <input class="field__input" type="number" id="acCruise" min="30" max="600" required>
+          </label>
+          <label class="field">
+            <span class="field__label">MAX MIN</span>
+            <input class="field__input" type="number" id="acEndurance" min="5" max="1200" required>
+          </label>
+        </div>
+        <div class="note note--tight" id="categoryHint"></div>
+        <button type="submit" class="btn btn--secondary">HINZUFÜGEN</button>
+      </form>
+    </section>
+
+    <!-- INFO PAGE -->
+    <section class="cdu__page" id="page-info">
+      <div class="cdu__pageTitle"><span class="lsk">&lt;</span> INFO</div>
+      <p class="infoText">
+        RANDOM ROUTE wählt aus <b id="airportCountLabel">…</b> realen Flughäfen zwei
+        passende aus: die Reichweite deines Flugzeugs (Cruise-Speed × Ausdauer, minus
+        10% Reserve) und die Pistenlänge/Flughafengröße werden gegen die Kategorie
+        des Flugzeugs geprüft — ein Segelflugzeug landet also nicht auf einem
+        Interkontinental-Hub, und ein Widebody nicht auf einem kurzen Feldflugplatz.
+      </p>
+      <p class="infoText">
+        Flughafendaten: OurAirports (Public Domain). Alle Daten bleiben lokal auf
+        deinem Gerät — es gibt keinen Server.
+      </p>
+      <button id="resetFleetBtn" class="btn btn--ghost">FLOTTE ZURÜCKSETZEN</button>
+    </section>
+
+  </div>
+</div>
+
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/globe.gl@2"></script>
+<script src="app.js"></script>
+</body>
+</html>
