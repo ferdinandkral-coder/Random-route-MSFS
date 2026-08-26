@@ -236,110 +236,6 @@ function renderRoute(result, aircraft) {
 
 /* ================= globe ================= */
 
-// Vereinfachte NOAA-Sonnenstandsformel: liefert [Laenge, Breite] des
-// Punkts, an dem die Sonne gerade im Zenit steht (Subsolarpunkt), fuer den
-// echten Tag/Nacht-Terminator passend zur aktuellen Uhrzeit.
-function getSunPosition(date) {
-  const ms = date.getTime();
-  const dayMs = 86400000;
-  const dayStart = Math.floor(ms / dayMs) * dayMs;
-  const fracDay = (ms - dayStart) / dayMs; // 0..1 UTC-Tagesanteil
-
-  const yearStart = Date.UTC(date.getUTCFullYear(), 0, 1);
-  const dayOfYear = Math.floor((dayStart - yearStart) / dayMs) + 1;
-
-  const gamma = (2 * Math.PI / 365) * (dayOfYear - 1 + fracDay);
-
-  const decl = 0.006918
-    - 0.399912 * Math.cos(gamma) + 0.070257 * Math.sin(gamma)
-    - 0.006758 * Math.cos(2 * gamma) + 0.000907 * Math.sin(2 * gamma)
-    - 0.002697 * Math.cos(3 * gamma) + 0.00148 * Math.sin(3 * gamma); // rad
-
-  const eqTimeMin = 229.18 * (
-    0.000075 + 0.001868 * Math.cos(gamma) - 0.032077 * Math.sin(gamma)
-    - 0.014615 * Math.cos(2 * gamma) - 0.040849 * Math.sin(2 * gamma)
-  );
-
-  const utcHours = fracDay * 24;
-  const subsolarLng = -15 * (utcHours - 12) - eqTimeMin / 4;
-  const subsolarLat = decl * (180 / Math.PI);
-
-  const wrappedLng = ((subsolarLng + 180) % 360 + 360) % 360 - 180;
-  return [wrappedLng, subsolarLat];
-}
-
-// Baut ein ShaderMaterial, das Tag- und Nachttextur je nach Sonnenstand
-// ueberblendet -- ergibt den echten, momentan gueltigen Terminator statt
-// eines statischen Nachtbilds.
-function buildDayNightMaterial() {
-  const loader = new THREE.TextureLoader();
-  const dayTexture = loader.load('https://cdn.jsdelivr.net/npm/three-globe/example/img/earth-blue-marble.jpg');
-  const nightTexture = loader.load('https://cdn.jsdelivr.net/npm/three-globe/example/img/earth-night.jpg');
-
-  const material = new THREE.ShaderMaterial({
-    uniforms: {
-      dayTexture: { value: dayTexture },
-      nightTexture: { value: nightTexture },
-      sunPosition: { value: new THREE.Vector2(0, 0) },
-    },
-    vertexShader: `
-      varying vec3 vNormal;
-      varying vec2 vUv;
-      void main() {
-        vNormal = normalize(normal);
-        vUv = uv;
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-      }
-    `,
-    fragmentShader: `
-      #define PI 3.141592653589793
-      uniform sampler2D dayTexture;
-      uniform sampler2D nightTexture;
-      uniform vec2 sunPosition;
-      varying vec3 vNormal;
-      varying vec2 vUv;
-
-      float toRad(in float a) { return a * PI / 180.0; }
-
-      vec3 polar2Cartesian(in float lat, in float lng) {
-        float phi = toRad(90.0 - lat);
-        float theta = toRad(90.0 - lng);
-        return vec3(
-          sin(phi) * cos(theta),
-          cos(phi),
-          sin(phi) * sin(theta)
-        );
-      }
-
-      void main() {
-        vec3 sunDir = normalize(polar2Cartesian(sunPosition.y, sunPosition.x));
-        float intensity = dot(normalize(vNormal), sunDir);
-
-        vec4 dayColor = texture2D(dayTexture, vUv);
-        vec4 nightColor = texture2D(nightTexture, vUv);
-        float blend = smoothstep(-0.15, 0.15, intensity);
-        vec3 color = mix(nightColor.rgb, dayColor.rgb, blend);
-
-        // sanfter Daemmerungs-Glow am Terminator
-        float dusk = 1.0 - smoothstep(0.0, 0.35, abs(intensity));
-        color += dusk * blend * (1.0 - blend) * 4.0 * vec3(0.4, 0.16, 0.02);
-
-        gl_FragColor = vec4(color, 1.0);
-      }
-    `,
-  });
-
-  return material;
-}
-
-function updateSunPosition() {
-  if (!globe) return;
-  const material = globe.globeMaterial();
-  if (!material || !material.uniforms || !material.uniforms.sunPosition) return;
-  const [lng, lat] = getSunPosition(new Date());
-  material.uniforms.sunPosition.value.set(lng, lat);
-}
-
 // Kompakte Auswahl an Grossstaedten fuer die Globus-Beschriftung.
 const CITY_LABELS = [
   { name: 'London', lat: 51.507, lng: -0.128 }, { name: 'Paris', lat: 48.857, lng: 2.352 },
@@ -401,7 +297,8 @@ async function loadCountries() {
 
 function initGlobe() {
   globe = Globe()(document.getElementById('globeContainer'))
-    .globeMaterial(buildDayNightMaterial())
+    .globeImageUrl('https://cdn.jsdelivr.net/npm/three-globe/example/img/earth-blue-marble.jpg')
+    .bumpImageUrl('https://cdn.jsdelivr.net/npm/three-globe/example/img/earth-topology.png')
     .backgroundImageUrl('https://cdn.jsdelivr.net/npm/three-globe/example/img/night-sky.png')
     .atmosphereColor('#52e0d1')
     .atmosphereAltitude(0.18)
@@ -443,9 +340,6 @@ function initGlobe() {
   window.addEventListener('resize', fitGlobeSize);
 
   globe.pointOfView({ lat: 25, lng: 15, altitude: 2.4 });
-
-  updateSunPosition();
-  setInterval(updateSunPosition, 60000);
 
   const cityLabels = CITY_LABELS.map(c => ({ ...c, isCountry: false }));
   globe.labelsData(cityLabels);

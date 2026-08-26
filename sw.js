@@ -1,4 +1,4 @@
-const CACHE = 'random-route-v6';
+const CACHE = 'random-route-v7';
 const ASSETS = [
   './',
   './index.html',
