@@ -18,8 +18,8 @@ const CATEGORIES = {
   ga_twin:    { code: 'MEP', label: 'Zweimot (GA)',         cruiseKt: 180, enduranceMin: 300, types: ['small_airport', 'medium_airport', 'large_airport'], minRwy: 2500 },
   turboprop:  { code: 'TBP', label: 'Turboprop',            cruiseKt: 280, enduranceMin: 300, types: ['small_airport', 'medium_airport', 'large_airport'], minRwy: 3500 },
   bizjet:     { code: 'BIZ', label: 'Business Jet',         cruiseKt: 450, enduranceMin: 360, types: ['medium_airport', 'large_airport'],                  minRwy: 5000 },
-  narrowbody: { code: 'NB',  label: 'Narrowbody Airliner',  cruiseKt: 460, enduranceMin: 360, types: ['medium_airport', 'large_airport'],                  minRwy: 6500 },
-  widebody:   { code: 'WB',  label: 'Widebody Airliner',    cruiseKt: 490, enduranceMin: 480, types: ['large_airport'],                                    minRwy: 8500 },
+  narrowbody: { code: 'NB',  label: 'Narrowbody Airliner',  cruiseKt: 460, enduranceMin: 360, types: ['medium_airport', 'large_airport'],                  minRwy: 6500, requireSched: true },
+  widebody:   { code: 'WB',  label: 'Widebody Airliner',    cruiseKt: 490, enduranceMin: 480, types: ['large_airport'],                                    minRwy: 8500, requireSched: true },
   helicopter: { code: 'HEL', label: 'Helikopter',           cruiseKt: 120, enduranceMin: 90,  types: ['small_airport', 'medium_airport', 'large_airport'], minRwy: 0 },
 };
 
@@ -105,8 +105,10 @@ seedDefaultFleet();
 let airports = [];
 let airportPool = {};   // category -> filtered airport array
 let globe = null;
-let currentAltitude = 2.2;
 let lastRoute = null;
+let liveSocket = null;
+let liveAircraft = null; // { lat, lon, alt, hdg, gs, ias, onGround }
+let liveFirstFix = true;
 
 /* ================= utils ================= */
 function loadFleet() {
@@ -163,7 +165,9 @@ async function loadAirports() {
 function buildAirportPools() {
   for (const [key, cat] of Object.entries(CATEGORIES)) {
     airportPool[key] = airports.filter(a =>
-      cat.types.includes(a.type) && (a.rwy_ft === 0 || a.rwy_ft >= cat.minRwy)
+      cat.types.includes(a.type) &&
+      (a.rwy_ft === 0 || a.rwy_ft >= cat.minRwy) &&
+      (!cat.requireSched || a.sched)
     );
   }
 }
@@ -231,14 +235,191 @@ function renderRoute(result, aircraft) {
 }
 
 /* ================= globe ================= */
+
+// Vereinfachte NOAA-Sonnenstandsformel: liefert [Laenge, Breite] des
+// Punkts, an dem die Sonne gerade im Zenit steht (Subsolarpunkt), fuer den
+// echten Tag/Nacht-Terminator passend zur aktuellen Uhrzeit.
+function getSunPosition(date) {
+  const ms = date.getTime();
+  const dayMs = 86400000;
+  const dayStart = Math.floor(ms / dayMs) * dayMs;
+  const fracDay = (ms - dayStart) / dayMs; // 0..1 UTC-Tagesanteil
+
+  const yearStart = Date.UTC(date.getUTCFullYear(), 0, 1);
+  const dayOfYear = Math.floor((dayStart - yearStart) / dayMs) + 1;
+
+  const gamma = (2 * Math.PI / 365) * (dayOfYear - 1 + fracDay);
+
+  const decl = 0.006918
+    - 0.399912 * Math.cos(gamma) + 0.070257 * Math.sin(gamma)
+    - 0.006758 * Math.cos(2 * gamma) + 0.000907 * Math.sin(2 * gamma)
+    - 0.002697 * Math.cos(3 * gamma) + 0.00148 * Math.sin(3 * gamma); // rad
+
+  const eqTimeMin = 229.18 * (
+    0.000075 + 0.001868 * Math.cos(gamma) - 0.032077 * Math.sin(gamma)
+    - 0.014615 * Math.cos(2 * gamma) - 0.040849 * Math.sin(2 * gamma)
+  );
+
+  const utcHours = fracDay * 24;
+  const subsolarLng = -15 * (utcHours - 12) - eqTimeMin / 4;
+  const subsolarLat = decl * (180 / Math.PI);
+
+  const wrappedLng = ((subsolarLng + 180) % 360 + 360) % 360 - 180;
+  return [wrappedLng, subsolarLat];
+}
+
+// Baut ein ShaderMaterial, das Tag- und Nachttextur je nach Sonnenstand
+// ueberblendet -- ergibt den echten, momentan gueltigen Terminator statt
+// eines statischen Nachtbilds.
+function buildDayNightMaterial() {
+  const loader = new THREE.TextureLoader();
+  const dayTexture = loader.load('https://cdn.jsdelivr.net/npm/three-globe/example/img/earth-blue-marble.jpg');
+  const nightTexture = loader.load('https://cdn.jsdelivr.net/npm/three-globe/example/img/earth-night.jpg');
+
+  const material = new THREE.ShaderMaterial({
+    uniforms: {
+      dayTexture: { value: dayTexture },
+      nightTexture: { value: nightTexture },
+      sunPosition: { value: new THREE.Vector2(0, 0) },
+    },
+    vertexShader: `
+      varying vec3 vNormal;
+      varying vec2 vUv;
+      void main() {
+        vNormal = normalize(normal);
+        vUv = uv;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: `
+      #define PI 3.141592653589793
+      uniform sampler2D dayTexture;
+      uniform sampler2D nightTexture;
+      uniform vec2 sunPosition;
+      varying vec3 vNormal;
+      varying vec2 vUv;
+
+      float toRad(in float a) { return a * PI / 180.0; }
+
+      vec3 polar2Cartesian(in float lat, in float lng) {
+        float phi = toRad(90.0 - lat);
+        float theta = toRad(90.0 - lng);
+        return vec3(
+          sin(phi) * cos(theta),
+          cos(phi),
+          sin(phi) * sin(theta)
+        );
+      }
+
+      void main() {
+        vec3 sunDir = normalize(polar2Cartesian(sunPosition.y, sunPosition.x));
+        float intensity = dot(normalize(vNormal), sunDir);
+
+        vec4 dayColor = texture2D(dayTexture, vUv);
+        vec4 nightColor = texture2D(nightTexture, vUv);
+        float blend = smoothstep(-0.15, 0.15, intensity);
+        vec3 color = mix(nightColor.rgb, dayColor.rgb, blend);
+
+        // sanfter Daemmerungs-Glow am Terminator
+        float dusk = 1.0 - smoothstep(0.0, 0.35, abs(intensity));
+        color += dusk * blend * (1.0 - blend) * 4.0 * vec3(0.4, 0.16, 0.02);
+
+        gl_FragColor = vec4(color, 1.0);
+      }
+    `,
+  });
+
+  return material;
+}
+
+function updateSunPosition() {
+  if (!globe) return;
+  const material = globe.globeMaterial();
+  if (!material || !material.uniforms || !material.uniforms.sunPosition) return;
+  const [lng, lat] = getSunPosition(new Date());
+  material.uniforms.sunPosition.value.set(lng, lat);
+}
+
+// Kompakte Auswahl an Grossstaedten fuer die Globus-Beschriftung.
+const CITY_LABELS = [
+  { name: 'London', lat: 51.507, lng: -0.128 }, { name: 'Paris', lat: 48.857, lng: 2.352 },
+  { name: 'Berlin', lat: 52.52, lng: 13.405 }, { name: 'Wien', lat: 48.208, lng: 16.373 },
+  { name: 'Zürich', lat: 47.377, lng: 8.541 }, { name: 'Madrid', lat: 40.417, lng: -3.703 },
+  { name: 'Rom', lat: 41.903, lng: 12.496 }, { name: 'Amsterdam', lat: 52.367, lng: 4.904 },
+  { name: 'Brüssel', lat: 50.85, lng: 4.352 }, { name: 'Lissabon', lat: 38.722, lng: -9.139 },
+  { name: 'Dublin', lat: 53.35, lng: -6.26 }, { name: 'Kopenhagen', lat: 55.676, lng: 12.568 },
+  { name: 'Stockholm', lat: 59.329, lng: 18.069 }, { name: 'Oslo', lat: 59.914, lng: 10.752 },
+  { name: 'Helsinki', lat: 60.169, lng: 24.938 }, { name: 'Warschau', lat: 52.23, lng: 21.011 },
+  { name: 'Prag', lat: 50.088, lng: 14.421 }, { name: 'Budapest', lat: 47.498, lng: 19.04 },
+  { name: 'Athen', lat: 37.984, lng: 23.728 }, { name: 'Istanbul', lat: 41.008, lng: 28.978 },
+  { name: 'Moskau', lat: 55.756, lng: 37.617 }, { name: 'Kiew', lat: 50.45, lng: 30.523 },
+  { name: 'New York', lat: 40.713, lng: -74.006 }, { name: 'Los Angeles', lat: 34.052, lng: -118.244 },
+  { name: 'Chicago', lat: 41.878, lng: -87.63 }, { name: 'Toronto', lat: 43.651, lng: -79.383 },
+  { name: 'Vancouver', lat: 49.283, lng: -123.121 }, { name: 'Mexiko-Stadt', lat: 19.433, lng: -99.133 },
+  { name: 'Miami', lat: 25.762, lng: -80.191 }, { name: 'San Francisco', lat: 37.774, lng: -122.419 },
+  { name: 'São Paulo', lat: -23.551, lng: -46.633 }, { name: 'Rio de Janeiro', lat: -22.906, lng: -43.172 },
+  { name: 'Buenos Aires', lat: -34.603, lng: -58.381 }, { name: 'Santiago', lat: -33.447, lng: -70.673 },
+  { name: 'Lima', lat: -12.046, lng: -77.043 }, { name: 'Bogotá', lat: 4.711, lng: -74.072 },
+  { name: 'Kairo', lat: 30.044, lng: 31.236 }, { name: 'Lagos', lat: 6.524, lng: 3.379 },
+  { name: 'Nairobi', lat: -1.292, lng: 36.822 }, { name: 'Johannesburg', lat: -26.204, lng: 28.047 },
+  { name: 'Casablanca', lat: 33.573, lng: -7.589 }, { name: 'Addis Abeba', lat: 9.03, lng: 38.74 },
+  { name: 'Tokio', lat: 35.676, lng: 139.65 }, { name: 'Peking', lat: 39.904, lng: 116.407 },
+  { name: 'Shanghai', lat: 31.23, lng: 121.474 }, { name: 'Seoul', lat: 37.566, lng: 126.978 },
+  { name: 'Bangkok', lat: 13.756, lng: 100.502 }, { name: 'Singapur', lat: 1.352, lng: 103.82 },
+  { name: 'Jakarta', lat: -6.208, lng: 106.845 }, { name: 'Mumbai', lat: 19.076, lng: 72.878 },
+  { name: 'Delhi', lat: 28.704, lng: 77.102 }, { name: 'Dubai', lat: 25.205, lng: 55.271 },
+  { name: 'Riad', lat: 24.713, lng: 46.675 }, { name: 'Tel Aviv', lat: 32.085, lng: 34.782 },
+  { name: 'Hongkong', lat: 22.319, lng: 114.169 }, { name: 'Manila', lat: 14.599, lng: 120.984 },
+  { name: 'Kuala Lumpur', lat: 3.139, lng: 101.687 }, { name: 'Karachi', lat: 24.861, lng: 67.001 },
+  { name: 'Sydney', lat: -33.868, lng: 151.209 }, { name: 'Melbourne', lat: -37.814, lng: 144.963 },
+  { name: 'Auckland', lat: -36.848, lng: 174.763 },
+];
+
+let countriesGeo = null;
+
+// Grober Schwerpunkt eines Landes fuer die Beschriftungsposition -- nutzt
+// den groessten Ring bei Multi-Polygonen (z.B. Inselstaaten) als Naeherung,
+// exakte geometrische Genauigkeit ist fuer eine Atlas-Beschriftung nicht noetig.
+function countryLabelPosition(feature) {
+  const geom = feature.geometry;
+  let ring;
+  if (geom.type === 'Polygon') {
+    ring = geom.coordinates[0];
+  } else {
+    ring = geom.coordinates.reduce((longest, poly) =>
+      poly[0].length > longest.length ? poly[0] : longest, geom.coordinates[0][0]);
+  }
+  let sumLat = 0, sumLng = 0;
+  ring.forEach(([lng, lat]) => { sumLat += lat; sumLng += lng; });
+  return { lat: sumLat / ring.length, lng: sumLng / ring.length };
+}
+
+async function loadCountries() {
+  const res = await fetch('countries.json');
+  countriesGeo = await res.json();
+}
+
 function initGlobe() {
   globe = Globe()(document.getElementById('globeContainer'))
-    .globeImageUrl('https://cdn.jsdelivr.net/npm/three-globe/example/img/earth-night.jpg')
-    .bumpImageUrl('https://cdn.jsdelivr.net/npm/three-globe/example/img/earth-topology.png')
+    .globeMaterial(buildDayNightMaterial())
     .backgroundImageUrl('https://cdn.jsdelivr.net/npm/three-globe/example/img/night-sky.png')
     .atmosphereColor('#52e0d1')
     .atmosphereAltitude(0.18)
     .showGraticules(false)
+    .polygonsData([])
+    .polygonGeoJsonGeometry('geometry')
+    .polygonCapColor(() => 'rgba(0,0,0,0)')
+    .polygonSideColor(() => 'rgba(0,0,0,0)')
+    .polygonStrokeColor(() => 'rgba(255,255,255,0.45)')
+    .polygonAltitude(0.001)
+    .labelsData([])
+    .labelLat('lat').labelLng('lng').labelText('name')
+    .labelSize((d) => (d.isCountry ? 0.55 : 0.38))
+    .labelColor((d) => (d.isCountry ? 'rgba(255,255,255,0.55)' : 'rgba(82,224,209,0.85)'))
+    .labelDotRadius((d) => (d.isCountry ? 0 : 0.25))
+    .labelResolution(2)
+    .labelAltitude(0.006)
+    .labelIncludeDot((d) => !d.isCountry)
     .arcsData([])
     .arcColor(() => ['#ffb300', '#52e0d1'])
     .arcDashLength(0.4)
@@ -250,14 +431,9 @@ function initGlobe() {
     .pointRadius(0.35)
     .pointAltitude(0.005)
     .pointColor('color')
-    .labelsData([])
-    .labelLat('lat').labelLng('lng').labelText('text')
-    .labelColor('color')
-    .labelDotRadius(0.28)
-    .labelSize(() => sizeForAltitude(currentAltitude))
-    .labelAltitude('alt')
-    .labelResolution(3)
-    .onZoom(({ altitude }) => { currentAltitude = altitude; });
+    .htmlElementsData([])
+    .htmlLat('lat').htmlLng('lng')
+    .htmlElement(d => d.el);
 
   globe.controls().autoRotate = true;
   globe.controls().autoRotateSpeed = 0.35;
@@ -267,35 +443,46 @@ function initGlobe() {
   window.addEventListener('resize', fitGlobeSize);
 
   globe.pointOfView({ lat: 25, lng: 15, altitude: 2.4 });
-  currentAltitude = 2.4;
+
+  updateSunPosition();
+  setInterval(updateSunPosition, 60000);
+
+  const cityLabels = CITY_LABELS.map(c => ({ ...c, isCountry: false }));
+  globe.labelsData(cityLabels);
+
+  loadCountries().then(() => {
+    if (!countriesGeo) return;
+    globe.polygonsData(countriesGeo.features);
+    const countryLabels = countriesGeo.features.map(f => ({
+      ...countryLabelPosition(f),
+      name: f.properties.name,
+      isCountry: true,
+    }));
+    globe.labelsData([...cityLabels, ...countryLabels]);
+  }).catch(err => console.error('Ländergrenzen konnten nicht geladen werden:', err));
 }
 function fitGlobeSize() {
   if (!globe) return;
   globe.width(window.innerWidth).height(window.innerHeight);
 }
-// smaller label text the further you zoom out, larger when zoomed in
-function sizeForAltitude(alt) {
-  const clamped = Math.min(Math.max(alt, 0.3), 3.2);
-  return 0.35 + (3.2 - clamped) * 0.12;
+
+// baut ein HTML-Label mit fester, zoom-unabhängiger Pixelgröße. offsetY
+// trennt Start-/Ziel-Beschriftung optisch, auch wenn beide Flughäfen nahe
+// beieinander liegen (verhindert das Überlappungsproblem endgültig).
+function makeAirportLabel(text, variantClass, offsetY) {
+  const wrap = document.createElement('div');
+  wrap.style.pointerEvents = 'none';
+  const inner = document.createElement('div');
+  inner.className = 'globeLabel ' + variantClass;
+  inner.style.transform = `translate(-50%, ${offsetY})`;
+  inner.textContent = text;
+  wrap.appendChild(inner);
+  return wrap;
 }
 
 function updateGlobe(result) {
   globe.controls().autoRotate = false;
-
-  globe.arcsData([{
-    startLat: result.dep.lat, startLng: result.dep.lon,
-    endLat: result.arr.lat, endLng: result.arr.lon,
-  }]);
-
-  globe.pointsData([
-    { lat: result.dep.lat, lng: result.dep.lon, color: '#ffb300' },
-    { lat: result.arr.lat, lng: result.arr.lon, color: '#52e0d1' },
-  ]);
-
-  globe.labelsData([
-    { lat: result.dep.lat, lng: result.dep.lon, text: displayName(result.dep), color: '#ffb300', alt: 0.012 },
-    { lat: result.arr.lat, lng: result.arr.lon, color: '#52e0d1', text: displayName(result.arr), alt: 0.045 },
-  ]);
+  refreshGlobeLayers();
 
   const midLat = (result.dep.lat + result.arr.lat) / 2;
   let midLng = (result.dep.lon + result.arr.lon) / 2;
@@ -304,6 +491,121 @@ function updateGlobe(result) {
 
   const alt = Math.min(3.2, Math.max(0.35, result.distKm / 8000 + 0.28));
   globe.pointOfView({ lat: midLat, lng: midLng, altitude: alt }, 1400);
+}
+
+// zeichnet Route (falls vorhanden) und Live-Flugzeug (falls verbunden)
+// gemeinsam neu, ohne sich gegenseitig zu überschreiben
+function refreshGlobeLayers() {
+  if (!globe) return;
+
+  const arcs = lastRoute ? [{
+    startLat: lastRoute.dep.lat, startLng: lastRoute.dep.lon,
+    endLat: lastRoute.arr.lat, endLng: lastRoute.arr.lon,
+  }] : [];
+
+  const points = [];
+  const labels = [];
+
+  if (lastRoute) {
+    points.push({ lat: lastRoute.dep.lat, lng: lastRoute.dep.lon, color: '#ffb300' });
+    points.push({ lat: lastRoute.arr.lat, lng: lastRoute.arr.lon, color: '#52e0d1' });
+    labels.push({ lat: lastRoute.dep.lat, lng: lastRoute.dep.lon, el: makeAirportLabel(displayName(lastRoute.dep), 'globeLabel--dep', '-170%') });
+    labels.push({ lat: lastRoute.arr.lat, lng: lastRoute.arr.lon, el: makeAirportLabel(displayName(lastRoute.arr), '', '60%') });
+  }
+
+  if (liveAircraft) {
+    points.push({ lat: liveAircraft.lat, lng: liveAircraft.lon, color: '#eef3f6' });
+    labels.push({ lat: liveAircraft.lat, lng: liveAircraft.lon, el: makeAirportLabel('✈ LIVE', 'globeLabel--live', '-170%') });
+  }
+
+  globe.arcsData(arcs);
+  globe.pointsData(points);
+  globe.htmlElementsData(labels);
+}
+
+/* ================= MSFS live tracking ================= */
+function connectLive() {
+  const url = document.getElementById('liveUrl').value.trim();
+  const statusEl = document.getElementById('liveStatus');
+  const btn = document.getElementById('liveConnectBtn');
+  if (!url) return;
+
+  if (location.protocol === 'https:' && url.startsWith('ws://')) {
+    statusEl.textContent = 'Diese Seite läuft über HTTPS — eine unverschlüsselte ws://-Verbindung wird vom Browser blockiert. Seite lokal öffnen (siehe INFO).';
+    return;
+  }
+
+  try { liveSocket = new WebSocket(url); }
+  catch (err) { statusEl.textContent = 'Ungültige Adresse.'; return; }
+
+  statusEl.textContent = 'Verbinde …';
+  btn.disabled = true;
+
+  liveSocket.onopen = () => {
+    statusEl.textContent = 'Verbunden — warte auf Daten von MSFS …';
+    btn.textContent = '⟲ TRENNEN';
+    btn.disabled = false;
+    liveFirstFix = true;
+  };
+  liveSocket.onmessage = (ev) => {
+    let data;
+    try { data = JSON.parse(ev.data); } catch { return; }
+    if (typeof data.lat !== 'number' || typeof data.lon !== 'number') return;
+    liveAircraft = data;
+    renderLiveData(data);
+    refreshGlobeLayers();
+    if (liveFirstFix) {
+      globe.pointOfView({ lat: data.lat, lng: data.lon, altitude: 0.6 }, 1200);
+      liveFirstFix = false;
+    }
+  };
+  liveSocket.onerror = () => { statusEl.textContent = 'Verbindungsfehler — läuft die Bridge (start.py)?'; };
+  liveSocket.onclose = () => {
+    statusEl.textContent = 'Nicht verbunden.';
+    btn.textContent = '⟲ VERBINDEN';
+    btn.disabled = false;
+    liveSocket = null;
+    liveAircraft = null;
+    document.getElementById('liveData').hidden = true;
+    refreshGlobeLayers();
+  };
+}
+function disconnectLive() {
+  if (liveSocket) liveSocket.close();
+}
+function renderLiveData(d) {
+  document.getElementById('liveData').hidden = false;
+  document.getElementById('liveLatLon').textContent = `${d.lat.toFixed(3)}, ${d.lon.toFixed(3)}`;
+  document.getElementById('liveAlt').textContent = d.altitude != null ? `${Math.round(d.altitude)} ft` : '—';
+  document.getElementById('liveHdg').textContent = d.heading != null ? `${Math.round(d.heading)}°` : '—';
+  document.getElementById('liveGs').textContent = d.gs != null ? `${Math.round(d.gs)} kt` : '—';
+  document.getElementById('liveIas').textContent = d.ias != null ? `${Math.round(d.ias)} kt` : '—';
+  document.getElementById('liveGround').textContent = d.onGround ? 'AM BODEN' : 'IN DER LUFT';
+}
+
+// Andockstelle fuer die Desktop-App (desktop-app/app.py): laeuft die Seite
+// dort in einem pywebview-Fenster, ruft Python direkt window.__liveUpdate()
+// mit den MSFS-Daten auf -- kein WebSocket noetig, kein Mixed-Content-Thema.
+window.__liveUpdate = function (data) {
+  if (typeof data.lat !== 'number' || typeof data.lon !== 'number') return;
+  liveAircraft = data;
+  renderLiveData(data);
+  refreshGlobeLayers();
+  if (liveFirstFix && globe) {
+    globe.pointOfView({ lat: data.lat, lng: data.lon, altitude: 0.6 }, 1200);
+    liveFirstFix = false;
+  }
+};
+
+function initDesktopAppMode() {
+  if (!window.pywebview) return false;
+  const statusEl = document.getElementById('liveStatus');
+  const btn = document.getElementById('liveConnectBtn');
+  const urlField = document.getElementById('liveUrl');
+  statusEl.textContent = 'Desktop-App erkannt — Live-Daten kommen automatisch, sobald MSFS läuft.';
+  btn.hidden = true;
+  urlField.closest('.field').hidden = true;
+  return true;
 }
 
 /* ================= fleet UI ================= */
@@ -511,6 +813,10 @@ function wireEvents() {
     renderRoute(result, aircraft);
   });
 
+  document.getElementById('liveConnectBtn').addEventListener('click', () => {
+    if (liveSocket) disconnectLive(); else connectLive();
+  });
+
   // clock
   function tickClock() {
     const el = document.getElementById('clockReadout');
@@ -533,7 +839,12 @@ async function boot() {
     console.error(err);
   }
 
-  if ('serviceWorker' in navigator) {
+  // pywebview meldet sich manchmal erst kurz nach dem Laden -> beides pruefen
+  if (!initDesktopAppMode()) {
+    window.addEventListener('pywebviewready', initDesktopAppMode);
+  }
+
+  if (!window.pywebview && 'serviceWorker' in navigator) {
     navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).catch(() => {});
   }
 }

@@ -1,4 +1,4 @@
-const CACHE = 'random-route-v5';
+const CACHE = 'random-route-v6';
 const ASSETS = [
   './',
   './index.html',
@@ -6,6 +6,7 @@ const ASSETS = [
   './app.js',
   './manifest.json',
   './airports.json',
+  './countries.json',
   './icon-192.png',
   './icon-512.png',
   './icon-maskable-512.png',
@@ -31,7 +32,7 @@ self.addEventListener('activate', e => {
 // Pages sofort beim nächsten Laden ankommt (Fallback auf Cache nur offline).
 // airports.json ändert sich praktisch nie und ist groß -> cache-first, spart
 // Datenvolumen und lädt sofort.
-const CACHE_FIRST = ['/airports.json', '/icon-192.png', '/icon-512.png', '/icon-maskable-512.png'];
+const CACHE_FIRST = ['/airports.json', '/countries.json', '/icon-192.png', '/icon-512.png', '/icon-maskable-512.png'];
 
 self.addEventListener('fetch', e => {
   const url = new URL(e.request.url);
