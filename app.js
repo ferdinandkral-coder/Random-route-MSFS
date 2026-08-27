@@ -290,16 +290,134 @@ function countryLabelPosition(feature) {
   return { lat: sumLat / ring.length, lng: sumLng / ring.length };
 }
 
+// Grobe Flaechenschaetzung ueber die Bounding-Box des Landes -- reicht aus,
+// um kleine/eng benachbarte Staaten (Haiti+Dom.Rep., Jamaika, ...) von der
+// Dauerbeschriftung auszuschliessen. Deren Namen wuerden bei JEDEM Zoom
+// kollidieren, da die Labelgroesse globus-relativ (nicht bildschirmfix) ist
+// -- Grenzen bleiben fuer alle Laender trotzdem sichtbar.
+function roughCountryArea(feature) {
+  const geom = feature.geometry;
+  let ring;
+  if (geom.type === 'Polygon') {
+    ring = geom.coordinates[0];
+  } else {
+    ring = geom.coordinates.reduce((longest, poly) =>
+      poly[0].length > longest.length ? poly[0] : longest, geom.coordinates[0][0]);
+  }
+  let minLat = 90, maxLat = -90, minLng = 180, maxLng = -180;
+  ring.forEach(([lng, lat]) => {
+    if (lat < minLat) minLat = lat;
+    if (lat > maxLat) maxLat = lat;
+    if (lng < minLng) minLng = lng;
+    if (lng > maxLng) maxLng = lng;
+  });
+  const avgLatRad = (minLat + maxLat) / 2 * Math.PI / 180;
+  return (maxLat - minLat) * (maxLng - minLng) * Math.max(0.15, Math.cos(avgLatRad));
+}
+
+const MAX_LABELED_COUNTRIES = 105;
+
 async function loadCountries() {
   const res = await fetch('countries.json');
   countriesGeo = await res.json();
 }
 
+// Vereinfachte NOAA-Sonnenstandsformel: liefert [Laenge, Breite] des
+// Punkts, an dem die Sonne gerade im Zenit steht (Subsolarpunkt) -- gegen
+// bekannte astronomische Referenzwerte geprueft (Sonnenwenden, Aequinoktien).
+function getSunPosition(date) {
+  const ms = date.getTime();
+  const dayMs = 86400000;
+  const dayStart = Math.floor(ms / dayMs) * dayMs;
+  const fracDay = (ms - dayStart) / dayMs;
+
+  const yearStart = Date.UTC(date.getUTCFullYear(), 0, 1);
+  const dayOfYear = Math.floor((dayStart - yearStart) / dayMs) + 1;
+
+  const gamma = (2 * Math.PI / 365) * (dayOfYear - 1 + fracDay);
+
+  const decl = 0.006918
+    - 0.399912 * Math.cos(gamma) + 0.070257 * Math.sin(gamma)
+    - 0.006758 * Math.cos(2 * gamma) + 0.000907 * Math.sin(2 * gamma)
+    - 0.002697 * Math.cos(3 * gamma) + 0.00148 * Math.sin(3 * gamma);
+
+  const eqTimeMin = 229.18 * (
+    0.000075 + 0.001868 * Math.cos(gamma) - 0.032077 * Math.sin(gamma)
+    - 0.014615 * Math.cos(2 * gamma) - 0.040849 * Math.sin(2 * gamma)
+  );
+
+  const utcHours = fracDay * 24;
+  const subsolarLng = -15 * (utcHours - 12) - eqTimeMin / 4;
+  const subsolarLat = decl * (180 / Math.PI);
+  const wrappedLng = ((subsolarLng + 180) % 360 + 360) % 360 - 180;
+  return [wrappedLng, subsolarLat];
+}
+
+// Nacht-Overlay: separates, zusaetzliches 3D-Objekt (three-globe-eigener
+// "customThreeObject"-Mechanismus) -- rendert NUR eine halbtransparente
+// Nachtseiten-Kugel mit Städtelichtern obendrauf. Bricht das hier aus
+// irgendeinem Grund, bleibt der Rest der App (Basis-Globus, Grenzen, Namen)
+// komplett unberuehrt funktionsfaehig, da nichts Bestehendes ersetzt wird.
+let nightOverlayCanvas = null, nightOverlayCtx = null, nightOverlayTexture = null;
+
+function buildNightOverlay(d, globeRadius) {
+  const w = 512, h = 256;
+  const canvas = document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  nightOverlayCanvas = canvas;
+  nightOverlayCtx = canvas.getContext('2d');
+  nightOverlayTexture = new THREE.CanvasTexture(canvas);
+
+  const nightMapTexture = new THREE.TextureLoader().load(
+    'https://cdn.jsdelivr.net/npm/three-globe@2.45.2/example/img/earth-night.jpg'
+  );
+
+  const geometry = new THREE.SphereGeometry(globeRadius * 1.004, 75, 75);
+  const material = new THREE.MeshBasicMaterial({
+    map: nightMapTexture,
+    transparent: true,
+    alphaMap: nightOverlayTexture,
+    depthWrite: false,
+  });
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.rotation.y = -Math.PI / 2; // exakt wie three-globe seine eigene Basiskugel ausrichtet
+  return mesh;
+}
+
+// Zeichnet die Nachtmaske (schwarz, Alpha = Nachtanteil) per Canvas2D neu --
+// reine JS/Trigonometrie, kein GLSL-Shader noetig.
+function updateNightMask() {
+  if (!nightOverlayCtx) return;
+  const [sunLng, sunLat] = getSunPosition(new Date());
+  const sunLatRad = sunLat * Math.PI / 180;
+  const sinSunLat = Math.sin(sunLatRad), cosSunLat = Math.cos(sunLatRad);
+  const w = nightOverlayCanvas.width, h = nightOverlayCanvas.height;
+  const imgData = nightOverlayCtx.createImageData(w, h);
+
+  for (let y = 0; y < h; y++) {
+    const lat = 90 - (y / (h - 1)) * 180;
+    const latRad = lat * Math.PI / 180;
+    const sinLat = Math.sin(latRad), cosLat = Math.cos(latRad);
+    for (let x = 0; x < w; x++) {
+      const lng = (x / (w - 1)) * 360 - 180;
+      const dLngRad = (lng - sunLng) * Math.PI / 180;
+      const cosAngle = sinLat * sinSunLat + cosLat * cosSunLat * Math.cos(dLngRad);
+      const t = Math.min(1, Math.max(0, (cosAngle + 0.12) / 0.24)); // 0=Nacht, 1=Tag
+      const alpha = Math.round((1 - t) * 255);
+      const idx = (y * w + x) * 4;
+      imgData.data[idx] = 0; imgData.data[idx + 1] = 0; imgData.data[idx + 2] = 0;
+      imgData.data[idx + 3] = alpha;
+    }
+  }
+  nightOverlayCtx.putImageData(imgData, 0, 0);
+  nightOverlayTexture.needsUpdate = true;
+}
+
 function initGlobe() {
   globe = Globe()(document.getElementById('globeContainer'))
-    .globeImageUrl('https://cdn.jsdelivr.net/npm/three-globe/example/img/earth-day.jpg')
-    .bumpImageUrl('https://cdn.jsdelivr.net/npm/three-globe/example/img/earth-topology.png')
-    .backgroundImageUrl('https://cdn.jsdelivr.net/npm/three-globe/example/img/night-sky.png')
+    .globeImageUrl('https://cdn.jsdelivr.net/npm/three-globe@2.45.2/example/img/earth-blue-marble.jpg')
+    .bumpImageUrl('https://cdn.jsdelivr.net/npm/three-globe@2.45.2/example/img/earth-topology.png')
+    .backgroundImageUrl('https://cdn.jsdelivr.net/npm/three-globe@2.45.2/example/img/night-sky.png')
     .atmosphereColor('#52e0d1')
     .atmosphereAltitude(0.18)
     .showGraticules(false)
@@ -311,8 +429,8 @@ function initGlobe() {
     .polygonAltitude(0.001)
     .labelsData([])
     .labelLat('lat').labelLng('lng').labelText('name')
-    .labelSize((d) => (d.isCountry ? 0.55 : 0.38))
-    .labelColor((d) => (d.isCountry ? 'rgba(255,255,255,0.55)' : 'rgba(82,224,209,0.85)'))
+    .labelSize((d) => (d.isCountry ? 0.45 : 0.34))
+    .labelColor((d) => (d.isCountry ? 'rgba(255,255,255,0.5)' : 'rgba(82,224,209,0.85)'))
     .labelDotRadius((d) => (d.isCountry ? 0 : 0.25))
     .labelResolution(2)
     .labelAltitude(0.006)
@@ -330,7 +448,9 @@ function initGlobe() {
     .pointColor('color')
     .htmlElementsData([])
     .htmlLat('lat').htmlLng('lng')
-    .htmlElement(d => d.el);
+    .htmlElement(d => d.el)
+    .customLayerData([{}])
+    .customThreeObject((d, globeRadius) => buildNightOverlay(d, globeRadius));
 
   globe.controls().autoRotate = true;
   globe.controls().autoRotateSpeed = 0.35;
@@ -341,17 +461,25 @@ function initGlobe() {
 
   globe.pointOfView({ lat: 25, lng: 15, altitude: 2.4 });
 
+  updateNightMask();
+  setTimeout(updateNightMask, 400); // falls das Overlay-Objekt erst leicht verzoegert entsteht
+  setInterval(updateNightMask, 60000);
+
   const cityLabels = CITY_LABELS.map(c => ({ ...c, isCountry: false }));
   globe.labelsData(cityLabels);
 
   loadCountries().then(() => {
     if (!countriesGeo) return;
     globe.polygonsData(countriesGeo.features);
-    const countryLabels = countriesGeo.features.map(f => ({
-      ...countryLabelPosition(f),
-      name: f.properties.name,
-      isCountry: true,
-    }));
+    const countryLabels = countriesGeo.features
+      .map(f => ({
+        ...countryLabelPosition(f),
+        name: f.properties.name,
+        isCountry: true,
+        area: roughCountryArea(f),
+      }))
+      .sort((a, b) => b.area - a.area)
+      .slice(0, MAX_LABELED_COUNTRIES);
     globe.labelsData([...cityLabels, ...countryLabels]);
   }).catch(err => console.error('Ländergrenzen konnten nicht geladen werden:', err));
 }
