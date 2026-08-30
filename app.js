@@ -322,101 +322,20 @@ async function loadCountries() {
   countriesGeo = await res.json();
 }
 
-// Vereinfachte NOAA-Sonnenstandsformel: liefert [Laenge, Breite] des
-// Punkts, an dem die Sonne gerade im Zenit steht -- gegen bekannte
-// astronomische Referenzwerte geprueft (Sonnenwenden, Aequinoktien).
-function getSunPosition(date) {
-  const ms = date.getTime();
-  const dayMs = 86400000;
-  const dayStart = Math.floor(ms / dayMs) * dayMs;
-  const fracDay = (ms - dayStart) / dayMs;
-
-  const yearStart = Date.UTC(date.getUTCFullYear(), 0, 1);
-  const dayOfYear = Math.floor((dayStart - yearStart) / dayMs) + 1;
-
-  const gamma = (2 * Math.PI / 365) * (dayOfYear - 1 + fracDay);
-
-  const decl = 0.006918
-    - 0.399912 * Math.cos(gamma) + 0.070257 * Math.sin(gamma)
-    - 0.006758 * Math.cos(2 * gamma) + 0.000907 * Math.sin(2 * gamma)
-    - 0.002697 * Math.cos(3 * gamma) + 0.00148 * Math.sin(3 * gamma);
-
-  const eqTimeMin = 229.18 * (
-    0.000075 + 0.001868 * Math.cos(gamma) - 0.032077 * Math.sin(gamma)
-    - 0.014615 * Math.cos(2 * gamma) - 0.040849 * Math.sin(2 * gamma)
-  );
-
-  const utcHours = fracDay * 24;
-  const subsolarLng = -15 * (utcHours - 12) - eqTimeMin / 4;
-  const subsolarLat = decl * (180 / Math.PI);
-  const wrappedLng = ((subsolarLng + 180) % 360 + 360) % 360 - 180;
-  return [wrappedLng, subsolarLat];
-}
-
-// Zielpunkt auf einer Kugel: Start (lat,lng), Peilung und Winkelabstand in
-// Grad -- Standardformel der Kugelnavigation, gegen bekannte Referenzpunkte
-// geprueft (max. Abweichung 0.000000 Grad ueber den vollen Kreis).
-function destinationPoint(lat, lng, bearingDeg, angDistDeg) {
-  const rad = Math.PI / 180;
-  const lat1 = lat * rad, lng1 = lng * rad;
-  const brng = bearingDeg * rad, d = angDistDeg * rad;
-  const lat2 = Math.asin(Math.sin(lat1) * Math.cos(d) + Math.cos(lat1) * Math.sin(d) * Math.cos(brng));
-  const lng2 = lng1 + Math.atan2(Math.sin(brng) * Math.sin(d) * Math.cos(lat1), Math.cos(d) - Math.sin(lat1) * Math.sin(lat2));
-  return { lat: lat2 / rad, lng: ((lng2 / rad + 540) % 360) - 180 };
-}
-
-// Baut die Nachthaelfte als GeoJSON-Polygon (Kreis mit 90 Grad Radius um
-// den Punkt genau gegenueber der Sonne = exakt eine Halbkugel) -- nutzt
-// dieselbe, bereits bewaehrte Polygon-Schicht wie die Laendergrenzen,
-// daher kein eigenes 3D-Objekt/Material noetig.
-function buildNightHemisphereFeature() {
-  const [sunLng, sunLat] = getSunPosition(new Date());
-  const centerLat = -sunLat;
-  const centerLng = ((sunLng + 180 + 180) % 360) - 180;
-  const steps = 72;
-  const ring = [];
-  for (let i = 0; i <= steps; i++) {
-    const bearing = (360 / steps) * i;
-    const p = destinationPoint(centerLat, centerLng, bearing, 90);
-    ring.push([p.lng, p.lat]);
-  }
-  return {
-    type: 'Feature',
-    properties: { isNightMask: true },
-    geometry: { type: 'Polygon', coordinates: [ring] },
-  };
-}
-
-// Aktualisiert die Nachtseiten-Flaeche in der bestehenden Polygon-Schicht,
-// ohne die Laendergrenzen anzutasten. Laeuft komplett abgesichert -- geht
-// hier etwas schief, bleibt der Rest des Globus unberuehrt funktionsfaehig.
-function updateNightMask() {
-  if (!globe || !countriesGeo) return;
-  try {
-    const nightFeature = buildNightHemisphereFeature();
-    globe.polygonsData([...countriesGeo.features, nightFeature]);
-  } catch (err) {
-    console.error('Tag/Nacht-Flaeche konnte nicht aktualisiert werden:', err);
-  }
-}
-
 function initGlobe() {
   globe = Globe()(document.getElementById('globeContainer'))
-    // Kachel-Engine statt statischem Bild: laedt Satellitenkacheln
-    // zoomabhaengig nach, wird beim Reinzoomen schaerfer (wie Google Earth).
-    .globeTileEngineUrl((x, y, l) =>
-      `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${l}/${y}/${x}`)
-    .globeTileEngineMaxLevel(15)
+    .globeImageUrl('https://cdn.jsdelivr.net/npm/three-globe@2.45.2/example/img/earth-blue-marble.jpg')
+    .bumpImageUrl('https://cdn.jsdelivr.net/npm/three-globe@2.45.2/example/img/earth-topology.png')
     .backgroundImageUrl('https://cdn.jsdelivr.net/npm/three-globe@2.45.2/example/img/night-sky.png')
     .atmosphereColor('#52e0d1')
     .atmosphereAltitude(0.18)
     .showGraticules(false)
     .polygonsData([])
     .polygonGeoJsonGeometry('geometry')
-    .polygonCapColor((d) => (d.properties && d.properties.isNightMask ? 'rgba(4,8,20,0.6)' : 'rgba(0,0,0,0)'))
+    .polygonCapColor(() => 'rgba(0,0,0,0)')
     .polygonSideColor(() => 'rgba(0,0,0,0)')
-    .polygonStrokeColor((d) => (d.properties && d.properties.isNightMask ? 'rgba(0,0,0,0)' : 'rgba(255,255,255,0.45)'))
-    .polygonAltitude((d) => (d.properties && d.properties.isNightMask ? 0.002 : 0.001))
+    .polygonStrokeColor(() => 'rgba(255,255,255,0.45)')
+    .polygonAltitude(0.001)
     .labelsData([])
     .labelLat('lat').labelLng('lng').labelText('name')
     .labelSize((d) => (d.isCountry ? 0.45 : 0.34))
@@ -454,8 +373,7 @@ function initGlobe() {
 
   loadCountries().then(() => {
     if (!countriesGeo) return;
-    updateNightMask();
-    setInterval(updateNightMask, 60000);
+    globe.polygonsData(countriesGeo.features);
     const countryLabels = countriesGeo.features
       .map(f => ({
         ...countryLabelPosition(f),
