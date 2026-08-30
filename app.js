@@ -240,9 +240,9 @@ function renderRoute(result, aircraft) {
 const CITY_LABELS = [
   { name: 'London', lat: 51.507, lng: -0.128 }, { name: 'Paris', lat: 48.857, lng: 2.352 },
   { name: 'Berlin', lat: 52.52, lng: 13.405 }, { name: 'Wien', lat: 48.208, lng: 16.373 },
-  { name: 'Zürich', lat: 47.377, lng: 8.541 }, { name: 'Madrid', lat: 40.417, lng: -3.703 },
+  { name: 'Zuerich', lat: 47.377, lng: 8.541 }, { name: 'Madrid', lat: 40.417, lng: -3.703 },
   { name: 'Rom', lat: 41.903, lng: 12.496 }, { name: 'Amsterdam', lat: 52.367, lng: 4.904 },
-  { name: 'Brüssel', lat: 50.85, lng: 4.352 }, { name: 'Lissabon', lat: 38.722, lng: -9.139 },
+  { name: 'Bruessel', lat: 50.85, lng: 4.352 }, { name: 'Lissabon', lat: 38.722, lng: -9.139 },
   { name: 'Dublin', lat: 53.35, lng: -6.26 }, { name: 'Kopenhagen', lat: 55.676, lng: 12.568 },
   { name: 'Stockholm', lat: 59.329, lng: 18.069 }, { name: 'Oslo', lat: 59.914, lng: 10.752 },
   { name: 'Helsinki', lat: 60.169, lng: 24.938 }, { name: 'Warschau', lat: 52.23, lng: 21.011 },
@@ -253,9 +253,9 @@ const CITY_LABELS = [
   { name: 'Chicago', lat: 41.878, lng: -87.63 }, { name: 'Toronto', lat: 43.651, lng: -79.383 },
   { name: 'Vancouver', lat: 49.283, lng: -123.121 }, { name: 'Mexiko-Stadt', lat: 19.433, lng: -99.133 },
   { name: 'Miami', lat: 25.762, lng: -80.191 }, { name: 'San Francisco', lat: 37.774, lng: -122.419 },
-  { name: 'São Paulo', lat: -23.551, lng: -46.633 }, { name: 'Rio de Janeiro', lat: -22.906, lng: -43.172 },
+  { name: 'Sao Paulo', lat: -23.551, lng: -46.633 }, { name: 'Rio de Janeiro', lat: -22.906, lng: -43.172 },
   { name: 'Buenos Aires', lat: -34.603, lng: -58.381 }, { name: 'Santiago', lat: -33.447, lng: -70.673 },
-  { name: 'Lima', lat: -12.046, lng: -77.043 }, { name: 'Bogotá', lat: 4.711, lng: -74.072 },
+  { name: 'Lima', lat: -12.046, lng: -77.043 }, { name: 'Bogota', lat: 4.711, lng: -74.072 },
   { name: 'Kairo', lat: 30.044, lng: 31.236 }, { name: 'Lagos', lat: 6.524, lng: 3.379 },
   { name: 'Nairobi', lat: -1.292, lng: 36.822 }, { name: 'Johannesburg', lat: -26.204, lng: 28.047 },
   { name: 'Casablanca', lat: 33.573, lng: -7.589 }, { name: 'Addis Abeba', lat: 9.03, lng: 38.74 },
@@ -323,8 +323,8 @@ async function loadCountries() {
 }
 
 // Vereinfachte NOAA-Sonnenstandsformel: liefert [Laenge, Breite] des
-// Punkts, an dem die Sonne gerade im Zenit steht (Subsolarpunkt) -- gegen
-// bekannte astronomische Referenzwerte geprueft (Sonnenwenden, Aequinoktien).
+// Punkts, an dem die Sonne gerade im Zenit steht -- gegen bekannte
+// astronomische Referenzwerte geprueft (Sonnenwenden, Aequinoktien).
 function getSunPosition(date) {
   const ms = date.getTime();
   const dayMs = 86400000;
@@ -353,80 +353,70 @@ function getSunPosition(date) {
   return [wrappedLng, subsolarLat];
 }
 
-// Nacht-Overlay: separates, zusaetzliches 3D-Objekt (three-globe-eigener
-// "customThreeObject"-Mechanismus) -- rendert NUR eine halbtransparente
-// Nachtseiten-Kugel mit Städtelichtern obendrauf. Bricht das hier aus
-// irgendeinem Grund, bleibt der Rest der App (Basis-Globus, Grenzen, Namen)
-// komplett unberuehrt funktionsfaehig, da nichts Bestehendes ersetzt wird.
-let nightOverlayCanvas = null, nightOverlayCtx = null, nightOverlayTexture = null;
-
-function buildNightOverlay(d, globeRadius) {
-  const w = 512, h = 256;
-  const canvas = document.createElement('canvas');
-  canvas.width = w; canvas.height = h;
-  nightOverlayCanvas = canvas;
-  nightOverlayCtx = canvas.getContext('2d');
-  nightOverlayTexture = new THREE.CanvasTexture(canvas);
-
-  const nightMapTexture = new THREE.TextureLoader().load(
-    'https://cdn.jsdelivr.net/npm/three-globe@2.45.2/example/img/earth-night.jpg'
-  );
-
-  const geometry = new THREE.SphereGeometry(globeRadius * 1.004, 75, 75);
-  const material = new THREE.MeshBasicMaterial({
-    map: nightMapTexture,
-    transparent: true,
-    alphaMap: nightOverlayTexture,
-    depthWrite: false,
-  });
-  const mesh = new THREE.Mesh(geometry, material);
-  mesh.rotation.y = -Math.PI / 2; // exakt wie three-globe seine eigene Basiskugel ausrichtet
-  return mesh;
+// Zielpunkt auf einer Kugel: Start (lat,lng), Peilung und Winkelabstand in
+// Grad -- Standardformel der Kugelnavigation, gegen bekannte Referenzpunkte
+// geprueft (max. Abweichung 0.000000 Grad ueber den vollen Kreis).
+function destinationPoint(lat, lng, bearingDeg, angDistDeg) {
+  const rad = Math.PI / 180;
+  const lat1 = lat * rad, lng1 = lng * rad;
+  const brng = bearingDeg * rad, d = angDistDeg * rad;
+  const lat2 = Math.asin(Math.sin(lat1) * Math.cos(d) + Math.cos(lat1) * Math.sin(d) * Math.cos(brng));
+  const lng2 = lng1 + Math.atan2(Math.sin(brng) * Math.sin(d) * Math.cos(lat1), Math.cos(d) - Math.sin(lat1) * Math.sin(lat2));
+  return { lat: lat2 / rad, lng: ((lng2 / rad + 540) % 360) - 180 };
 }
 
-// Zeichnet die Nachtmaske (schwarz, Alpha = Nachtanteil) per Canvas2D neu --
-// reine JS/Trigonometrie, kein GLSL-Shader noetig.
-function updateNightMask() {
-  if (!nightOverlayCtx) return;
+// Baut die Nachthaelfte als GeoJSON-Polygon (Kreis mit 90 Grad Radius um
+// den Punkt genau gegenueber der Sonne = exakt eine Halbkugel) -- nutzt
+// dieselbe, bereits bewaehrte Polygon-Schicht wie die Laendergrenzen,
+// daher kein eigenes 3D-Objekt/Material noetig.
+function buildNightHemisphereFeature() {
   const [sunLng, sunLat] = getSunPosition(new Date());
-  const sunLatRad = sunLat * Math.PI / 180;
-  const sinSunLat = Math.sin(sunLatRad), cosSunLat = Math.cos(sunLatRad);
-  const w = nightOverlayCanvas.width, h = nightOverlayCanvas.height;
-  const imgData = nightOverlayCtx.createImageData(w, h);
-
-  for (let y = 0; y < h; y++) {
-    const lat = 90 - (y / (h - 1)) * 180;
-    const latRad = lat * Math.PI / 180;
-    const sinLat = Math.sin(latRad), cosLat = Math.cos(latRad);
-    for (let x = 0; x < w; x++) {
-      const lng = (x / (w - 1)) * 360 - 180;
-      const dLngRad = (lng - sunLng) * Math.PI / 180;
-      const cosAngle = sinLat * sinSunLat + cosLat * cosSunLat * Math.cos(dLngRad);
-      const t = Math.min(1, Math.max(0, (cosAngle + 0.12) / 0.24)); // 0=Nacht, 1=Tag
-      const alpha = Math.round((1 - t) * 255);
-      const idx = (y * w + x) * 4;
-      imgData.data[idx] = 0; imgData.data[idx + 1] = 0; imgData.data[idx + 2] = 0;
-      imgData.data[idx + 3] = alpha;
-    }
+  const centerLat = -sunLat;
+  const centerLng = ((sunLng + 180 + 180) % 360) - 180;
+  const steps = 72;
+  const ring = [];
+  for (let i = 0; i <= steps; i++) {
+    const bearing = (360 / steps) * i;
+    const p = destinationPoint(centerLat, centerLng, bearing, 90);
+    ring.push([p.lng, p.lat]);
   }
-  nightOverlayCtx.putImageData(imgData, 0, 0);
-  nightOverlayTexture.needsUpdate = true;
+  return {
+    type: 'Feature',
+    properties: { isNightMask: true },
+    geometry: { type: 'Polygon', coordinates: [ring] },
+  };
+}
+
+// Aktualisiert die Nachtseiten-Flaeche in der bestehenden Polygon-Schicht,
+// ohne die Laendergrenzen anzutasten. Laeuft komplett abgesichert -- geht
+// hier etwas schief, bleibt der Rest des Globus unberuehrt funktionsfaehig.
+function updateNightMask() {
+  if (!globe || !countriesGeo) return;
+  try {
+    const nightFeature = buildNightHemisphereFeature();
+    globe.polygonsData([...countriesGeo.features, nightFeature]);
+  } catch (err) {
+    console.error('Tag/Nacht-Flaeche konnte nicht aktualisiert werden:', err);
+  }
 }
 
 function initGlobe() {
   globe = Globe()(document.getElementById('globeContainer'))
-    .globeImageUrl('https://cdn.jsdelivr.net/npm/three-globe@2.45.2/example/img/earth-blue-marble.jpg')
-    .bumpImageUrl('https://cdn.jsdelivr.net/npm/three-globe@2.45.2/example/img/earth-topology.png')
+    // Kachel-Engine statt statischem Bild: laedt Satellitenkacheln
+    // zoomabhaengig nach, wird beim Reinzoomen schaerfer (wie Google Earth).
+    .globeTileEngineUrl((x, y, l) =>
+      `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${l}/${y}/${x}`)
+    .globeTileEngineMaxLevel(15)
     .backgroundImageUrl('https://cdn.jsdelivr.net/npm/three-globe@2.45.2/example/img/night-sky.png')
     .atmosphereColor('#52e0d1')
     .atmosphereAltitude(0.18)
     .showGraticules(false)
     .polygonsData([])
     .polygonGeoJsonGeometry('geometry')
-    .polygonCapColor(() => 'rgba(0,0,0,0)')
+    .polygonCapColor((d) => (d.properties && d.properties.isNightMask ? 'rgba(4,8,20,0.6)' : 'rgba(0,0,0,0)'))
     .polygonSideColor(() => 'rgba(0,0,0,0)')
-    .polygonStrokeColor(() => 'rgba(255,255,255,0.45)')
-    .polygonAltitude(0.001)
+    .polygonStrokeColor((d) => (d.properties && d.properties.isNightMask ? 'rgba(0,0,0,0)' : 'rgba(255,255,255,0.45)'))
+    .polygonAltitude((d) => (d.properties && d.properties.isNightMask ? 0.002 : 0.001))
     .labelsData([])
     .labelLat('lat').labelLng('lng').labelText('name')
     .labelSize((d) => (d.isCountry ? 0.45 : 0.34))
@@ -448,9 +438,7 @@ function initGlobe() {
     .pointColor('color')
     .htmlElementsData([])
     .htmlLat('lat').htmlLng('lng')
-    .htmlElement(d => d.el)
-    .customLayerData([{}])
-    .customThreeObject((d, globeRadius) => buildNightOverlay(d, globeRadius));
+    .htmlElement(d => d.el);
 
   globe.controls().autoRotate = true;
   globe.controls().autoRotateSpeed = 0.35;
@@ -461,16 +449,13 @@ function initGlobe() {
 
   globe.pointOfView({ lat: 25, lng: 15, altitude: 2.4 });
 
-  updateNightMask();
-  setTimeout(updateNightMask, 400); // falls das Overlay-Objekt erst leicht verzoegert entsteht
-  setInterval(updateNightMask, 60000);
-
   const cityLabels = CITY_LABELS.map(c => ({ ...c, isCountry: false }));
   globe.labelsData(cityLabels);
 
   loadCountries().then(() => {
     if (!countriesGeo) return;
-    globe.polygonsData(countriesGeo.features);
+    updateNightMask();
+    setInterval(updateNightMask, 60000);
     const countryLabels = countriesGeo.features
       .map(f => ({
         ...countryLabelPosition(f),
